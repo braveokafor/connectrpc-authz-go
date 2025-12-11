@@ -1,0 +1,27 @@
+version: "2"
+
+run:
+  concurrency: 1
+  go: "1.25"
+  relative-path-mode: cfg
+  build-tags:
+    - codeanalysis
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+    - golines
+
+linters:
+  default: standard
+  enable:
+    - cyclop
+    - errname
+  settings:
+    cyclop:
+      max-complexity: 15
+  exclusions:
+    generated: strict
