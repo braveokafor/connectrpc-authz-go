@@ -1,0 +1,4 @@
+p, admin, /test.v1.TestService/AdminMethod, execute
+p, user, /test.v1.TestService/UserMethod, execute
+g, jane@example.com, admin
+g, john@example.com, user
