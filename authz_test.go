@@ -144,10 +144,7 @@ func TestInterceptorStreamingHandler(t *testing.T) {
 				connect.WithInterceptors(interceptor),
 			))
 
-			srv := httptest.NewUnstartedServer(mux)
-			srv.EnableHTTP2 = true
-			srv.StartTLS()
-			t.Cleanup(srv.Close)
+			srv := startHTTPServer(t, mux)
 
 			client := connect.NewClient[emptypb.Empty, emptypb.Empty](
 				srv.Client(),
@@ -205,12 +202,8 @@ func TestInterceptorStreamingClient(t *testing.T) {
 		},
 	))
 
-	srv := httptest.NewUnstartedServer(mux)
-	srv.EnableHTTP2 = true
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
+	srv := startHTTPServer(t, mux)
 
-	// Client-side interceptor
 	client := connect.NewClient[emptypb.Empty, emptypb.Empty](
 		srv.Client(),
 		srv.URL+testProcedure,
@@ -294,7 +287,7 @@ func startHTTPServer(tb testing.TB, h http.Handler) *httptest.Server {
 	tb.Helper()
 	srv := httptest.NewUnstartedServer(h)
 	srv.EnableHTTP2 = true
-	srv.Start()
+	srv.StartTLS()
 	tb.Cleanup(srv.Close)
 	return srv
 }
