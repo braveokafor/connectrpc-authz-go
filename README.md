@@ -109,12 +109,12 @@ type User struct {
 
 func main() {
 	// Extract subject (email) from identity for Casbin
-	extractSubject := func(identity any) string {
+	extractSubject := func(identity any) []string {
 		user, ok := identity.(*User)
 		if !ok {
-			return ""
+			return nil
 		}
-		return user.Email
+		return []string{user.Email}
 	}
 
 	// Create Casbin enforcer from policy files
@@ -178,6 +178,48 @@ getIdentity := func(ctx context.Context) any {
 
 interceptor := authz.NewInterceptor(getIdentity, authorizeRequest)
 ```
+
+## Multi-Subject Authorization
+
+The Casbin enforcer supports checking multiple subjects (e.g., multiple roles) from a single identity. If **any** subject is authorized, access is granted.
+
+### Pattern 1: Single Subject (Native RBAC)
+
+Use Casbin's grouping (`g`) to map users to roles:
+
+```go
+// model.conf with role_definition and g(r.sub, p.sub) matcher
+// Policies:
+// g, user@example.com, admin
+// p, admin, /resource, execute
+
+extractSubject := func(identity any) []string {
+    user := identity.(*User)
+    return []string{user.Email}  // Single subject
+}
+```
+
+Casbin resolves roles internally using the `g` mappings.
+
+### Pattern 2: Multi-Subject (Direct Role Checking)
+
+Pass multiple subjects (roles) directly for checking:
+
+```go
+// model.conf with standard matcher (no grouping needed)
+// Policies:
+// p, admin, /resource, execute
+// p, editor, /resource, execute
+
+extractSubject := func(identity any) []string {
+    user := identity.(*User)
+    return user.Roles  // ["admin", "editor"]
+}
+```
+
+The enforcer checks each role. If any role has permission, access is granted. This pattern works well with:
+- Dynamic roles from JWT claims
+- Roles not stored in Casbin
 
 ## Examples
 

@@ -14,19 +14,20 @@ import (
 )
 
 // CasbinEnforcer wraps a Casbin enforcer to implement the Enforcer interface.
-// It performs authorization checks by mapping identity to subject (via user-provided extractor),
+// It performs authorization checks by mapping identity to subjects (via user-provided extractor),
 // procedure to object, and using "execute" as the action.
+// Supports multi-subject authorization - if any subject is authorized, access is granted.
 type CasbinEnforcer struct {
 	enforcer         *casbin.Enforcer
-	subjectExtractor func(any) string
+	subjectExtractor func(any) []string
 }
 
 // NewCasbinEnforcerFromFiles creates a CasbinEnforcer from model and policy file paths.
-// The subjectExtractor function converts the identity (from IdentityFunc) to a subject string
-// for Casbin enforcement.
+// The subjectExtractor function converts the identity (from IdentityFunc) to a list of subjects
+// for Casbin enforcement. If any subject is authorized, access is granted.
 func NewCasbinEnforcerFromFiles(
 	modelPath, policyPath string,
-	subjectExtractor func(any) string,
+	subjectExtractor func(any) []string,
 ) (*CasbinEnforcer, error) {
 	e, err := casbin.NewEnforcer(modelPath, policyPath)
 	if err != nil {
@@ -40,10 +41,12 @@ func NewCasbinEnforcerFromFiles(
 
 // NewCasbinEnforcerFromAdapter creates a CasbinEnforcer with a casbin model and adapter.
 // This allows using database adapters, file system adapters, or any custom storage backend.
+// The subjectExtractor function converts the identity to a list of subjects.
+// If any subject is authorized, access is granted.
 func NewCasbinEnforcerFromAdapter(
 	m model.Model,
 	a persist.Adapter,
-	subjectExtractor func(any) string,
+	subjectExtractor func(any) []string,
 ) (*CasbinEnforcer, error) {
 	e, err := casbin.NewEnforcer(m, a)
 	if err != nil {
@@ -57,9 +60,11 @@ func NewCasbinEnforcerFromAdapter(
 
 // NewCasbinEnforcerFromString creates a CasbinEnforcer from model and policy text.
 // This is useful for testing or when policies are embedded as strings in the application.
+// The subjectExtractor function converts the identity to a list of subjects.
+// If any subject is authorized, access is granted.
 func NewCasbinEnforcerFromString(
 	modelText, policyText string,
-	subjectExtractor func(any) string,
+	subjectExtractor func(any) []string,
 ) (*CasbinEnforcer, error) {
 	m, err := model.NewModelFromString(modelText)
 	if err != nil {
@@ -81,19 +86,26 @@ func NewCasbinEnforcerFromString(
 // Enforce implements the Enforcer interface by checking if the identity
 // is authorized to access the procedure using Casbin policies.
 // The action is always "execute".
+// Checks all subjects returned by subjectExtractor - if ANY subject is authorized, access is granted.
 func (e *CasbinEnforcer) Enforce(ctx context.Context, identity any, procedure string) error {
-	subject := e.subjectExtractor(identity)
+	subjects := e.subjectExtractor(identity)
 
-	allowed, err := e.enforcer.Enforce(subject, procedure, "execute")
-	if err != nil {
-		return fmt.Errorf("failed to enforce policy: %w", err)
+	if len(subjects) == 0 {
+		return Errorf("no subjects found for identity")
 	}
 
-	if !allowed {
-		return Errorf("subject %q denied access to %q", subject, procedure)
+	for _, subject := range subjects {
+		allowed, err := e.enforcer.Enforce(subject, procedure, "execute")
+		if err != nil {
+			return fmt.Errorf("failed to enforce policy: %w", err)
+		}
+
+		if allowed {
+			return nil // ANY subject passes
+		}
 	}
 
-	return nil
+	return Errorf("access denied to procedure %q", procedure)
 }
 
 // Enforcer returns the underlying casbin.Enforcer for advanced operations

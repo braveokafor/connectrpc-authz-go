@@ -49,8 +49,8 @@ func TestNewCasbinEnforcerFromFiles(t *testing.T) {
 			enforcer, err := authz.NewCasbinEnforcerFromFiles(
 				tt.modelPath,
 				tt.policyPath,
-				func(identity any) string {
-					return identity.(string)
+				func(identity any) []string {
+					return []string{identity.(string)}
 				},
 			)
 
@@ -115,8 +115,8 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 			enforcer, err := authz.NewCasbinEnforcerFromString(
 				tt.modelText,
 				tt.policyText,
-				func(identity any) string {
-					return identity.(string)
+				func(identity any) []string {
+					return []string{identity.(string)}
 				},
 			)
 
@@ -148,8 +148,8 @@ func TestNewCasbinEnforcerFromAdapter(t *testing.T) {
 		enforcer, err := authz.NewCasbinEnforcerFromAdapter(
 			m,
 			a,
-			func(identity any) string {
-				return identity.(string)
+			func(identity any) []string {
+				return []string{identity.(string)}
 			},
 		)
 		require.NoError(t, err)
@@ -174,8 +174,8 @@ func TestCasbinEnforcer_Enforce(t *testing.T) {
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(
 		"testdata/casbin/model.conf",
 		"testdata/casbin/policy.csv",
-		func(identity any) string {
-			return identity.(string)
+		func(identity any) []string {
+			return []string{identity.(string)}
 		},
 	)
 	require.NoError(t, err)
@@ -232,8 +232,8 @@ func TestCasbinEnforcer_RBAC(t *testing.T) {
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(
 		"testdata/casbin/rbac_model.conf",
 		"testdata/casbin/rbac_policy.csv",
-		func(identity any) string {
-			return identity.(string)
+		func(identity any) []string {
+			return []string{identity.(string)}
 		},
 	)
 	require.NoError(t, err)
@@ -289,8 +289,8 @@ func TestCasbinEnforcer_UnderlyingEnforcer(t *testing.T) {
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(
 		"testdata/casbin/model.conf",
 		"testdata/casbin/policy.csv",
-		func(identity any) string {
-			return identity.(string)
+		func(identity any) []string {
+			return []string{identity.(string)}
 		},
 	)
 	require.NoError(t, err)
@@ -321,11 +321,11 @@ func TestCasbinEnforcer_Integration(t *testing.T) {
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(
 		"testdata/casbin/model.conf",
 		"testdata/casbin/policy.csv",
-		func(identity any) string {
+		func(identity any) []string {
 			if identity == nil {
-				return ""
+				return nil
 			}
-			return identity.(string)
+			return []string{identity.(string)}
 		},
 	)
 	require.NoError(t, err)
@@ -381,6 +381,87 @@ func TestCasbinEnforcer_Integration(t *testing.T) {
 			if tt.wantCode > 0 {
 				require.Error(t, err)
 				assert.Equal(t, tt.wantCode, connect.CodeOf(err))
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestCasbinEnforcer_MultiRole(t *testing.T) {
+	t.Parallel()
+
+	type userWithRoles struct {
+		Email string
+		Roles []string
+	}
+
+	extractSubjects := func(identity any) []string {
+		user, ok := identity.(*userWithRoles)
+		if !ok || len(user.Roles) == 0 {
+			return nil
+		}
+		return user.Roles
+	}
+
+	enforcer, err := authz.NewCasbinEnforcerFromFiles(
+		"testdata/casbin/multirole_model.conf",
+		"testdata/casbin/multirole_policy.csv",
+		extractSubjects,
+	)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		user      *userWithRoles
+		procedure string
+		wantErr   bool
+	}{
+		{
+			name: "one role matches - admin",
+			user: &userWithRoles{
+				Email: "jane@example.com",
+				Roles: []string{"user", "admin"},
+			},
+			procedure: "/test.v1.TestService/AdminMethod",
+			wantErr:   false,
+		},
+		{
+			name: "one role matches - user",
+			user: &userWithRoles{
+				Email: "john@example.com",
+				Roles: []string{"guest", "user"},
+			},
+			procedure: "/test.v1.TestService/UserMethod",
+			wantErr:   false,
+		},
+		{
+			name: "no roles match",
+			user: &userWithRoles{
+				Email: "guest@example.com",
+				Roles: []string{"guest", "visitor"},
+			},
+			procedure: "/test.v1.TestService/AdminMethod",
+			wantErr:   true,
+		},
+		{
+			name: "empty roles array",
+			user: &userWithRoles{
+				Email: "empty@example.com",
+				Roles: []string{},
+			},
+			procedure: "/test.v1.TestService/AdminMethod",
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := enforcer.Enforce(context.Background(), tt.user, tt.procedure)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
 			} else {
 				require.NoError(t, err)
 			}

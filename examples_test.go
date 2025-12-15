@@ -86,12 +86,12 @@ func ExampleNewCasbinEnforcerFromFiles() {
 		Roles: []string{"user"},
 	}
 
-	extractSubject := func(identity any) string {
+	extractSubject := func(identity any) []string {
 		user, ok := identity.(*User)
 		if !ok {
-			return ""
+			return nil
 		}
-		return user.Email
+		return []string{user.Email}
 	}
 
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(
@@ -129,12 +129,12 @@ func ExampleNewCasbinEnforcerFromAdapter() {
 		Roles: []string{"user"},
 	}
 
-	extractSubject := func(identity any) string {
+	extractSubject := func(identity any) []string {
 		u, ok := identity.(*User)
 		if !ok {
-			return ""
+			return nil
 		}
-		return u.Email
+		return []string{u.Email}
 	}
 
 	// Load Casbin model from file
@@ -194,12 +194,12 @@ func ExampleInterceptor() {
 		Roles: []string{"user"},
 	}
 
-	extractSubject := func(identity any) string {
+	extractSubject := func(identity any) []string {
 		user, ok := identity.(*User)
 		if !ok {
-			return ""
+			return nil
 		}
-		return user.Email
+		return []string{user.Email}
 	}
 
 	enforcer, err := authz.NewCasbinEnforcerFromFiles(

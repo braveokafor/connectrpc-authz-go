@@ -1,0 +1,3 @@
+p, admin, /test.v1.TestService/AdminMethod, execute
+p, user, /test.v1.TestService/UserMethod, execute
+p, editor, /test.v1.TestService/EditMethod, execute
