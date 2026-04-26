@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package document.v1;
+
+option go_package = "github.com/braveokafor/connectrpc-authz-go/examples/fullstack/gen/document/v1;documentv1";
+
+service DocumentService {
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+  rpc CreateDocument(CreateDocumentRequest) returns (CreateDocumentResponse);
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+}
+
+message GetDocumentRequest {
+  string id = 1;
+}
+
+message GetDocumentResponse {
+  string id = 1;
+  string title = 2;
+  string content = 3;
+}
+
+message CreateDocumentRequest {
+  string title = 1;
+  string content = 2;
+}
+
+message CreateDocumentResponse {
+  string id = 1;
+}
+
+message DeleteDocumentRequest {
+  string id = 1;
+}
+
+message DeleteDocumentResponse {}
