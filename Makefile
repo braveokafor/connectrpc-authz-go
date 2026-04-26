@@ -9,7 +9,7 @@ MAKEFLAGS += --no-print-directory
 BIN := .tmp/bin
 export PATH := $(BIN):$(PATH)
 export GOBIN := $(abspath $(BIN))
-COPYRIGHT_YEARS := 2025
+COPYRIGHT_YEARS := 2025-2026
 LICENSE_IGNORE := --ignore testdata/
 
 .PHONY: help

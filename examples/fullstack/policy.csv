@@ -1,0 +1,10 @@
+p, admin, /document.v1.DocumentService/GetDocument, execute
+p, admin, /document.v1.DocumentService/CreateDocument, execute
+p, admin, /document.v1.DocumentService/DeleteDocument, execute
+p, editor, /document.v1.DocumentService/GetDocument, execute
+p, editor, /document.v1.DocumentService/CreateDocument, execute
+p, viewer, /document.v1.DocumentService/GetDocument, execute
+
+g, alice, admin
+g, bob, editor
+g, charlie, viewer
