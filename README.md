@@ -37,34 +37,37 @@ type User struct {
 	Roles []string
 }
 
-func authorizeRequest(ctx context.Context, identity any, procedure string) error {
-	user, ok := identity.(*User)
-	if !ok {
-		return authz.Errorf("invalid identity type")
-	}
-
-	// Require admin role for admin procedures
-	if procedure == "/admin.v1.AdminService/DeleteUser" {
-		if !slices.Contains(user.Roles, "admin") {
-			return authz.Errorf("requires admin role")
-		}
-	}
-
-	return nil
-}
-
-func getIdentity(ctx context.Context) any {
-	// Extract identity from context (set by your authentication middleware)
-	user, _ := ctx.Value("user").(*User)
-	return user
-}
-
 func main() {
-	mux := http.NewServeMux()
+	// Custom authorization logic as an EnforcerFunc
+	checkAuth := authz.EnforcerFunc(func(ctx context.Context, identity any, procedure string) error {
+		user, ok := identity.(*User)
+		if !ok {
+			return authz.Errorf("invalid identity type")
+		}
+
+		// Require admin role for admin procedures
+		if procedure == "/admin.v1.AdminService/DeleteUser" {
+			if !slices.Contains(user.Roles, "admin") {
+				return authz.Errorf("requires admin role")
+			}
+		}
+		return nil
+	})
+
+	getIdentity := func(ctx context.Context) any {
+		// Extract identity from context (set by your authentication middleware)
+		user, _ := ctx.Value("user").(*User)
+		return user
+	}
+
 
 	// Create authorization interceptor
-	interceptor := authz.NewInterceptor(getIdentity, authorizeRequest)
+	interceptor, err := authz.NewInterceptor(getIdentity, checkAuth)
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	mux := http.NewServeMux()
 	// Register service with interceptor
 	mux.Handle(greetv1connect.NewGreetServiceHandler(
 		&GreetService{},
@@ -76,79 +79,83 @@ func main() {
 }
 ```
 
-The interceptor extracts the identity using `getIdentity`, then calls your `authorizeRequest` function to check permissions. If authorization fails, the RPC returns `CodePermissionDenied`. If no identity is found, it returns `CodeUnauthenticated`.
+The interceptor extracts the identity using `getIdentity`, then calls your `Enforcer` to check permissions. If authorization fails, the RPC returns `CodePermissionDenied`. If no identity is found, it returns `CodeUnauthenticated`.
 
 ## Features
 
 - **Decoupled Design**: Works with any authentication system - no dependencies on [authn-go](https://github.com/connectrpc/authn-go) or specific auth libraries
-- **Flexible Authorization**: Bring your own authz logic or use built-in Casbin integration
+- **Flexible Authorization**: Bring your own authz logic via `EnforcerFunc`, or use built-in Casbin integration
 - **Casbin Support**: Optional Casbin adapter with file-based, adapter-based, and programmatic configuration
+- **Decision Hooks**: Optional `DecisionFunc` callback for logging, metrics, audit trails, and webhooks
 - **Unary and Streaming**: Supports both unary and streaming RPCs
-- **ConnectRPC Native**: Implements connect.Interceptor interface following production patterns
+- **ConnectRPC Native**: Implements `connect.Interceptor` interface following production patterns
+
+## Decision Handler
+
+React to authorization outcomes - logging, metrics, audit trails, Slack webhooks, Kafka events:
+
+```go
+onDecision := func(ctx context.Context, d authz.Decision) {
+	if d.Allowed {
+		log.Printf("ALLOW subject=%v procedure=%s", d.Identity, d.Procedure)
+	} else {
+		log.Printf("DENY  subject=%v procedure=%s err=%v", d.Identity, d.Procedure, d.Error)
+	}
+}
+
+interceptor, err := authz.NewInterceptor(getIdentity, enforcer,
+	authz.WithDecisionHandler(onDecision),
+)
+```
 
 ## Casbin Integration
 
 For policy-based authorization, use the built-in Casbin enforcer:
 
 ```go
-package main
+// Extract subject from identity for Casbin
+extractSubject := func(identity any) []string {
+	user, ok := identity.(*User)
+	if !ok {
+		return nil
+	}
+	return []string{user.Email}
+}
 
-import (
-	"context"
-	"log"
-	"net/http"
-
-	"connectrpc.com/connect"
-	authz "github.com/braveokafor/connectrpc-authz-go"
-	"example.com/gen/order/v1/orderv1connect"
+// Create Casbin enforcer from policy files
+enforcer, err := authz.NewCasbinEnforcerFromFiles(
+	"model.conf",
+	"policy.csv",
+	extractSubject,
 )
-
-type User struct {
-	Email string
+if err != nil {
+	log.Fatal(err)
 }
 
-func main() {
-	// Extract subject (email) from identity for Casbin
-	extractSubject := func(identity any) []string {
-		user, ok := identity.(*User)
-		if !ok {
-			return nil
-		}
-		return []string{user.Email}
-	}
-
-	// Create Casbin enforcer from policy files
-	enforcer, err := authz.NewCasbinEnforcerFromFiles(
-		"model.conf",
-		"policy.csv",
-		extractSubject,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	getIdentity := func(ctx context.Context) any {
-		user, _ := ctx.Value("user").(*User)
-		return user
-	}
-
-	// Create interceptor with Casbin enforcement
-	interceptor := authz.NewInterceptor(getIdentity, authz.EnforcerFunc(enforcer))
-
-	mux := http.NewServeMux()
-	mux.Handle(orderv1connect.NewOrderServiceHandler(
-		&OrderService{},
-		connect.WithInterceptors(interceptor),
-	))
-
-	http.ListenAndServe("localhost:8080", mux)
-}
+// Create interceptor - CasbinEnforcer implements Enforcer
+interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
 ```
 
 Three constructors available:
 - `NewCasbinEnforcerFromFiles(modelPath, policyPath, subjectExtractor)` - Casbin file paths
 - `NewCasbinEnforcerFromAdapter(model, adapter, subjectExtractor)` - Database/Redis/custom adapters
 - `NewCasbinEnforcerFromString(modelText, policyText, subjectExtractor)` - Mostly for testing
+
+### Custom action resolver
+
+By default, the Casbin action is `"execute"`. Use `WithActionResolver` for fine-grained actions:
+
+```go
+enforcer, err := authz.NewCasbinEnforcerFromFiles(
+	"model.conf", "policy.csv", extractSubject,
+	authz.WithActionResolver(func(procedure string) string {
+		if strings.HasPrefix(procedure, "/read.") {
+			return "read"
+		}
+		return "write"
+	}),
+)
+```
 
 ## Working with Authentication
 
@@ -163,7 +170,7 @@ getIdentity := func(ctx context.Context) any {
 	return authn.GetInfo(ctx) // Returns identity set by authn middleware
 }
 
-interceptor := authz.NewInterceptor(getIdentity, authorizeRequest)
+interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
 ```
 
 **Custom authentication:**
@@ -176,65 +183,21 @@ getIdentity := func(ctx context.Context) any {
 	return user
 }
 
-interceptor := authz.NewInterceptor(getIdentity, authorizeRequest)
+interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
 ```
 
-## Multi-Subject Authorization
+## Full Example
 
-The Casbin enforcer supports checking multiple subjects (e.g., multiple roles) from a single identity. If **any** subject is authorized, access is granted.
-
-### Pattern 1: Single Subject (Native RBAC)
-
-Use Casbin's grouping (`g`) to map users to roles:
-
-```go
-// model.conf with role_definition and g(r.sub, p.sub) matcher
-// Policies:
-// g, user@example.com, admin
-// p, admin, /resource, execute
-
-extractSubject := func(identity any) []string {
-    user := identity.(*User)
-    return []string{user.Email}  // Single subject
-}
-```
-
-Casbin resolves roles internally using the `g` mappings.
-
-### Pattern 2: Multi-Subject (Direct Role Checking)
-
-Pass multiple subjects (roles) directly for checking:
-
-```go
-// model.conf with standard matcher (no grouping needed)
-// Policies:
-// p, admin, /resource, execute
-// p, editor, /resource, execute
-
-extractSubject := func(identity any) []string {
-    user := identity.(*User)
-    return user.Roles  // ["admin", "editor"]
-}
-```
-
-The enforcer checks each role. If any role has permission, access is granted. This pattern works well with:
-- Dynamic roles from JWT claims
-- Roles not stored in Casbin
-
-## Examples
-
-See [pkg.go.dev](https://pkg.go.dev/github.com/braveokafor/connectrpc-authz-go#pkg-examples) for runnable examples:
-- Custom authorization function
-- Casbin with file-based policies
-- Casbin with database adapter
-- Full interceptor integration
-
-<!--
-For a complete example with JWT authentication + Casbin authorization, see [examples/auth-integration](examples/auth-integration).
--->
+See [examples/fullstack](examples/fullstack) for a complete runnable service with:
+- JWT token issuance and validation
+- `connectrpc.com/authn` middleware
+- Casbin RBAC policies
+- Decision handler logging
+- gRPC reflection
+- curl and grpcurl usage examples
 
 ## Status
 
-Requires Go 1.25+.
+Requires Go 1.26+.
 
 This project follows semantic versioning.

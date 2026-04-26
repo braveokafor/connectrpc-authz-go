@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Brave Okafor
+// Copyright (c) 2025-2026 Brave Okafor
 // SPDX-License-Identifier: MIT
 
 package authz_test
@@ -359,7 +359,8 @@ func TestCasbinEnforcer_Integration(t *testing.T) {
 				return tt.identity
 			}
 
-			interceptor := authz.NewInterceptor(getIdentity, authz.EnforcerFunc(enforcer))
+			interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
+			require.NoError(t, err)
 
 			mux := http.NewServeMux()
 			mux.Handle(testProcedure, connect.NewUnaryHandler(
@@ -376,7 +377,7 @@ func TestCasbinEnforcer_Integration(t *testing.T) {
 				srv.Client(),
 				srv.URL+testProcedure,
 			)
-			_, err := client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
+			_, err = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
 
 			if tt.wantCode > 0 {
 				require.Error(t, err)
@@ -415,7 +416,7 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 		name      string
 		user      *userWithRoles
 		procedure string
-		wantErr   bool
+		wantCode  connect.Code
 	}{
 		{
 			name: "one role matches - admin",
@@ -424,7 +425,6 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 				Roles: []string{"user", "admin"},
 			},
 			procedure: "/test.v1.TestService/AdminMethod",
-			wantErr:   false,
 		},
 		{
 			name: "one role matches - user",
@@ -433,7 +433,6 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 				Roles: []string{"guest", "user"},
 			},
 			procedure: "/test.v1.TestService/UserMethod",
-			wantErr:   false,
 		},
 		{
 			name: "no roles match",
@@ -442,7 +441,7 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 				Roles: []string{"guest", "visitor"},
 			},
 			procedure: "/test.v1.TestService/AdminMethod",
-			wantErr:   true,
+			wantCode:  connect.CodePermissionDenied,
 		},
 		{
 			name: "empty roles array",
@@ -451,7 +450,7 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 				Roles: []string{},
 			},
 			procedure: "/test.v1.TestService/AdminMethod",
-			wantErr:   true,
+			wantCode:  connect.CodeUnauthenticated,
 		},
 	}
 
@@ -459,12 +458,87 @@ func TestCasbinEnforcer_MultiRole(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			err := enforcer.Enforce(context.Background(), tt.user, tt.procedure)
-			if tt.wantErr {
+			if tt.wantCode > 0 {
 				require.Error(t, err)
-				assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+				assert.Equal(t, tt.wantCode, connect.CodeOf(err))
 			} else {
 				require.NoError(t, err)
 			}
 		})
 	}
+}
+
+func TestCasbinEnforcer_NilSubjectExtractor(t *testing.T) {
+	t.Parallel()
+
+	_, err := authz.NewCasbinEnforcerFromFiles(
+		"testdata/casbin/model.conf",
+		"testdata/casbin/policy.csv",
+		nil,
+	)
+	require.ErrorIs(t, err, authz.ErrNilSubjectExtractor)
+}
+
+func TestCasbinEnforcer_WithActionResolver(t *testing.T) {
+	t.Parallel()
+
+	const (
+		modelText = `
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`
+		policyText = `
+p, jane@example.com, /test.v1.TestService/GetData, read
+p, jane@example.com, /test.v1.TestService/UpdateData, write
+`
+	)
+
+	actionResolver := func(procedure string) string {
+		switch {
+		case len(procedure) > 4 && procedure[len(procedure)-7:] == "GetData":
+			return "read"
+		default:
+			return "write"
+		}
+	}
+
+	enforcer, err := authz.NewCasbinEnforcerFromString(
+		modelText,
+		policyText,
+		func(identity any) []string {
+			return []string{identity.(string)}
+		},
+		authz.WithActionResolver(actionResolver),
+	)
+	require.NoError(t, err)
+
+	// read action matches
+	err = enforcer.Enforce(context.Background(), "jane@example.com", "/test.v1.TestService/GetData")
+	require.NoError(t, err)
+
+	// write action matches
+	err = enforcer.Enforce(
+		context.Background(),
+		"jane@example.com",
+		"/test.v1.TestService/UpdateData",
+	)
+	require.NoError(t, err)
+
+	// read action on write-only procedure - denied
+	err = enforcer.Enforce(
+		context.Background(),
+		"jane@example.com",
+		"/test.v1.TestService/DeleteData",
+	)
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Brave Okafor
+// Copyright (c) 2025-2026 Brave Okafor
 // SPDX-License-Identifier: MIT
 
 package authz_test
@@ -6,6 +6,7 @@ package authz_test
 import (
 	"context"
 	"fmt"
+	"log"
 	"slices"
 
 	authz "github.com/braveokafor/connectrpc-authz-go"
@@ -34,44 +35,94 @@ func ExampleNewInterceptor() {
 	}
 
 	// Custom authorization logic
-	checkAuth := func(ctx context.Context, identity any, procedure string) error {
-		user, ok := identity.(*User)
-		if !ok {
-			return authz.Errorf("invalid identity type")
-		}
-
-		// Require admin role for admin procedures
-		if procedure == "/admin.v1.AdminService/DeleteUser" {
-			if !slices.Contains(user.Roles, "admin") {
-				return authz.Errorf("requires admin role")
+	checkAuth := authz.EnforcerFunc(
+		func(ctx context.Context, identity any, procedure string) error {
+			user, ok := identity.(*User)
+			if !ok {
+				return authz.Errorf("invalid identity type")
 			}
-		}
 
-		return nil
-	}
+			// Require admin role for admin procedures
+			if procedure == "/admin.v1.AdminService/DeleteUser" {
+				if !slices.Contains(user.Roles, "admin") {
+					return authz.Errorf("requires admin role")
+				}
+			}
+
+			return nil
+		},
+	)
 
 	getIdentity := func(ctx context.Context) any {
 		user, _ := ctx.Value(userContextKey{}).(*User)
 		return user
 	}
 
-	interceptor := authz.NewInterceptor(getIdentity, checkAuth)
+	interceptor, err := authz.NewInterceptor(getIdentity, checkAuth)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
 	_ = interceptor // Use with connect.WithInterceptors(interceptor)
 
 	// Demonstrate authorization checks
-	err := checkAuth(context.Background(), admin, "/admin.v1.AdminService/DeleteUser")
+	err = checkAuth.Enforce(context.Background(), admin, "/admin.v1.AdminService/DeleteUser")
 	fmt.Printf("Admin DeleteUser: %v\n", err == nil)
 
-	err = checkAuth(context.Background(), regularUser, "/admin.v1.AdminService/DeleteUser")
+	err = checkAuth.Enforce(context.Background(), regularUser, "/admin.v1.AdminService/DeleteUser")
 	fmt.Printf("User DeleteUser: %v\n", err == nil)
 
-	err = checkAuth(context.Background(), regularUser, "/user.v1.UserService/GetProfile")
+	err = checkAuth.Enforce(context.Background(), regularUser, "/user.v1.UserService/GetProfile")
 	fmt.Printf("User GetProfile: %v\n", err == nil)
 
 	// Output:
 	// Admin DeleteUser: true
 	// User DeleteUser: false
 	// User GetProfile: true
+}
+
+// ExampleWithDecisionHandler demonstrates using the decision handler
+// for logging authorization outcomes.
+func ExampleWithDecisionHandler() {
+	checkAuth := authz.EnforcerFunc(
+		func(ctx context.Context, identity any, procedure string) error {
+			user := identity.(*User)
+			if procedure == "/admin.v1.AdminService/Delete" &&
+				!slices.Contains(user.Roles, "admin") {
+				return authz.Errorf("requires admin role")
+			}
+			return nil
+		},
+	)
+
+	getIdentity := func(ctx context.Context) any {
+		user, _ := ctx.Value(userContextKey{}).(*User)
+		return user
+	}
+
+	onDecision := func(ctx context.Context, d authz.Decision) {
+		if d.Allowed {
+			log.Printf("ALLOW identity=%v procedure=%s", d.Identity, d.Procedure)
+		} else {
+			log.Printf("DENY  identity=%v procedure=%s error=%v", d.Identity, d.Procedure, d.Error)
+		}
+	}
+
+	interceptor, err := authz.NewInterceptor(
+		getIdentity,
+		checkAuth,
+		authz.WithDecisionHandler(onDecision),
+	)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	_ = interceptor // Use with connect.WithInterceptors(interceptor)
+
+	fmt.Println("interceptor created with decision handler")
+
+	// Output:
+	// interceptor created with decision handler
 }
 
 // ExampleNewCasbinEnforcerFromFiles demonstrates creating a Casbin enforcer
@@ -217,7 +268,11 @@ func ExampleInterceptor() {
 		return user
 	}
 
-	interceptor := authz.NewInterceptor(getIdentity, authz.EnforcerFunc(enforcer))
+	interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
 	_ = interceptor // Use with connect.WithInterceptors(interceptor)
 
 	adminCtx := context.WithValue(context.Background(), userContextKey{}, admin)
