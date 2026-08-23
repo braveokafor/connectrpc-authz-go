@@ -1,97 +1,100 @@
 // Copyright (c) 2025-2026 Brave Okafor
 // SPDX-License-Identifier: MIT
 
-// Package authz provides authorization interceptors for ConnectRPC.
 package authz
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
 
 	"connectrpc.com/connect"
 )
 
-// IdentityFunc extracts the authenticated identity from the request context.
-// It should return the identity information (e.g., user, roles, claims) or nil
-// if no identity is present. The returned value is passed to [Enforcer.Enforce].
-//
-// Implementations must be safe to call concurrently.
-type IdentityFunc func(context.Context) any
+// Request is the read-only input an [Enforcer] sees for one RPC.
+type Request struct {
+	// Identity is nil for an unauthenticated caller.
+	Identity any
+	Spec     connect.Spec
+	Peer     connect.Peer
+	Header   http.Header
+	// Message is nil on streaming RPCs.
+	Message any
+}
 
-// Enforcer checks whether the given identity is authorized to access the
-// specified procedure. Return nil if authorized, or an error (typically
-// produced with [Errorf]) if not.
-//
-// Implementations must be safe to call concurrently.
+// Enforcer authorises an RPC. Return nil to allow, or a *connect.Error to deny with a code.
 type Enforcer interface {
-	Enforce(ctx context.Context, identity any, procedure string) error
+	Enforce(ctx context.Context, r *Request) error
 }
 
-// EnforcerFunc is an adapter to use ordinary functions as [Enforcer]s.
-type EnforcerFunc func(ctx context.Context, identity any, procedure string) error
+// EnforcerFunc adapts a function to [Enforcer].
+type EnforcerFunc func(ctx context.Context, r *Request) error
 
-func (f EnforcerFunc) Enforce(ctx context.Context, identity any, procedure string) error {
-	return f(ctx, identity, procedure)
+func (f EnforcerFunc) Enforce(ctx context.Context, r *Request) error {
+	return f(ctx, r)
 }
 
-// Decision represents the outcome of an authorization check.
+// ErrorPermissionDenied returns a [connect.CodePermissionDenied] error.
+func ErrorPermissionDenied(template string, args ...any) *connect.Error {
+	return connect.NewError(connect.CodePermissionDenied, fmt.Errorf(template, args...))
+}
+
+// ErrorUnauthenticated returns a [connect.CodeUnauthenticated] error.
+func ErrorUnauthenticated(template string, args ...any) *connect.Error {
+	return connect.NewError(connect.CodeUnauthenticated, fmt.Errorf(template, args...))
+}
+
+// IdentityFunc returns the authenticated identity in ctx, or nil.
+type IdentityFunc func(ctx context.Context) any
+
+// Decision records one authorisation outcome.
 type Decision struct {
-	Identity  any // nil if unauthenticated
-	Procedure string
-	Allowed   bool
-	Error     error // nil if allowed
+	Request  *Request
+	Duration time.Duration
+	Allowed  bool
+	// Error is the Enforcer's raw error, before wire sanitisation.
+	Error error
 }
 
-// DecisionFunc is called after every authorization decision.
-// Called synchronously - launch a goroutine inside if you need async.
+// DecisionFunc runs after every decision, synchronously.
 type DecisionFunc func(ctx context.Context, decision Decision)
 
-// InterceptorOption configures an [Interceptor].
-type InterceptorOption func(*Interceptor)
+// Option configures an [Interceptor].
+type Option func(*Interceptor)
 
-// WithDecisionHandler registers a callback invoked after every authorization
-// decision (both allow and deny).
-func WithDecisionHandler(fn DecisionFunc) InterceptorOption {
+// WithIdentityFunc sets the identity source.
+func WithIdentityFunc(fn IdentityFunc) Option {
+	return func(i *Interceptor) {
+		i.getIdentity = fn
+	}
+}
+
+// WithDecisionHandler registers a callback run after every decision.
+func WithDecisionHandler(fn DecisionFunc) Option {
 	return func(i *Interceptor) {
 		i.onDecision = fn
 	}
 }
 
-// Interceptor is a [connect.Interceptor] that enforces authorization
-// for RPC requests. It extracts the identity using the provided [IdentityFunc],
-// then checks authorization using the provided [Enforcer].
-//
-// Authorization is checked once at the start of each RPC or stream.
-// If the identity is nil, the interceptor returns [connect.CodeUnauthenticated].
-// If authorization fails, the interceptor returns [connect.CodePermissionDenied].
-//
-// This interceptor is intended for use on server handlers.
+// Interceptor authorises server RPCs with an [Enforcer], and is a no-op on clients.
 type Interceptor struct {
-	getIdentity IdentityFunc
 	enforcer    Enforcer
+	getIdentity IdentityFunc
 	onDecision  DecisionFunc
 }
 
 var _ connect.Interceptor = (*Interceptor)(nil)
 
-// NewInterceptor creates an [Interceptor] that enforces authorization
-// using the provided identity extraction function and enforcer.
-func NewInterceptor(
-	getIdentity IdentityFunc,
-	enforcer Enforcer,
-	opts ...InterceptorOption,
-) (*Interceptor, error) {
-	if getIdentity == nil {
-		return nil, ErrNilIdentityFunc
-	}
+// ErrNilEnforcer means the [Enforcer] given to [NewInterceptor] was nil.
+var ErrNilEnforcer = errors.New("authz: enforcer must not be nil")
+
+func NewInterceptor(enforcer Enforcer, opts ...Option) (*Interceptor, error) {
 	if enforcer == nil {
 		return nil, ErrNilEnforcer
 	}
-	i := &Interceptor{
-		getIdentity: getIdentity,
-		enforcer:    enforcer,
-	}
+	i := &Interceptor{enforcer: enforcer}
 	for _, opt := range opts {
 		opt(i)
 	}
@@ -101,15 +104,22 @@ func NewInterceptor(
 // WrapUnary implements [connect.Interceptor].
 func (i *Interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-		if err := i.authorize(ctx, req.Spec().Procedure); err != nil {
+		if req.Spec().IsClient {
+			return next(ctx, req)
+		}
+		if err := i.authorize(ctx, &Request{
+			Spec:    req.Spec(),
+			Peer:    req.Peer(),
+			Header:  req.Header(),
+			Message: req.Any(),
+		}); err != nil {
 			return nil, err
 		}
 		return next(ctx, req)
 	}
 }
 
-// WrapStreamingClient implements [connect.Interceptor].
-// For server-side authorization, this is a passthrough.
+// WrapStreamingClient implements [connect.Interceptor] as a passthrough.
 func (i *Interceptor) WrapStreamingClient(
 	next connect.StreamingClientFunc,
 ) connect.StreamingClientFunc {
@@ -121,53 +131,48 @@ func (i *Interceptor) WrapStreamingHandler(
 	next connect.StreamingHandlerFunc,
 ) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
-		if err := i.authorize(ctx, conn.Spec().Procedure); err != nil {
+		if err := i.authorize(ctx, &Request{
+			Spec:   conn.Spec(),
+			Peer:   conn.Peer(),
+			Header: conn.RequestHeader(),
+		}); err != nil {
 			return err
 		}
 		return next(ctx, conn)
 	}
 }
 
-func (i *Interceptor) authorize(ctx context.Context, procedure string) error {
-	identity := i.getIdentity(ctx)
-	if identity == nil {
-		err := ErrorUnauthenticated("no identity found in context")
-		i.notify(ctx, Decision{Procedure: procedure, Error: err})
-		return err
+func (i *Interceptor) authorize(ctx context.Context, r *Request) error {
+	if i.getIdentity != nil {
+		r.Identity = i.getIdentity(ctx)
 	}
-	err := i.enforcer.Enforce(ctx, identity, procedure)
-	i.notify(ctx, Decision{
-		Identity:  identity,
-		Procedure: procedure,
-		Allowed:   err == nil,
-		Error:     err,
-	})
-	return err
-}
-
-func (i *Interceptor) notify(ctx context.Context, d Decision) {
+	start := time.Now()
+	err := i.enforce(ctx, r)
 	if i.onDecision != nil {
-		i.onDecision(ctx, d)
+		i.onDecision(
+			ctx,
+			Decision{Request: r, Duration: time.Since(start), Allowed: err == nil, Error: err},
+		)
 	}
+	if err == nil {
+		return nil
+	}
+	var cerr *connect.Error
+	if errors.As(err, &cerr) {
+		return cerr
+	}
+	return ErrorPermissionDenied("permission denied")
 }
 
-// InferProcedure returns the inferred RPC procedure from a URL. It's returned
-// in the form "/service/method" if a valid suffix is found. If the URL doesn't
-// contain a service and method, the entire path and false is returned.
-func InferProcedure(u *url.URL) (string, bool) {
-	path := u.Path
-	ultimate := strings.LastIndex(path, "/")
-	if ultimate < 0 {
-		return u.Path, false
-	}
-	penultimate := strings.LastIndex(path[:ultimate], "/")
-	if penultimate < 0 {
-		return u.Path, false
-	}
-	procedure := path[penultimate:]
-	// Ensure that the service and method are non-empty.
-	if ultimate == len(path)-1 || penultimate == ultimate-1 {
-		return u.Path, false
-	}
-	return procedure, true
+// enforce runs the Enforcer with panic containment.
+func (i *Interceptor) enforce(ctx context.Context, r *Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			if p == http.ErrAbortHandler {
+				panic(p)
+			}
+			err = fmt.Errorf("authz: enforcer panic: %v", p)
+		}
+	}()
+	return i.enforcer.Enforce(ctx, r)
 }

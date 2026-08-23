@@ -26,6 +26,10 @@ gen: clean
 build:
 	go build -o bin/server .
 
+.PHONY: upgrade
+upgrade: ## Upgrade dependencies
+	go get -u -t ./... && go mod tidy -v
+
 .PHONY: run
 run:
 	go run .

@@ -5,9 +5,9 @@ package authz_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync/atomic"
 	"testing"
 
@@ -18,10 +18,13 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// Ensure Interceptor implements connect.Interceptor interface.
-var _ connect.Interceptor = &authz.Interceptor{}
-
 const testProcedure = "/test.v1.TestService/TestMethod"
+
+func identityOf(v any) authz.IdentityFunc {
+	return func(context.Context) any { return v }
+}
+
+func allowAll(ctx context.Context, r *authz.Request) error { return nil }
 
 func TestInterceptorUnary(t *testing.T) {
 	t.Parallel()
@@ -39,13 +42,8 @@ func TestInterceptorUnary(t *testing.T) {
 		{
 			name:       "permission_denied",
 			identity:   "john@example.com",
-			authzError: authz.Errorf("permission denied"),
+			authzError: authz.ErrorPermissionDenied("permission denied"),
 			wantCode:   connect.CodePermissionDenied,
-		},
-		{
-			name:     "no_identity",
-			identity: nil,
-			wantCode: connect.CodeUnauthenticated,
 		},
 	}
 
@@ -53,30 +51,21 @@ func TestInterceptorUnary(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			getIdentity := func(ctx context.Context) any {
-				return tt.identity
-			}
-
 			enforcer := authz.EnforcerFunc(
-				func(ctx context.Context, identity any, procedure string) error {
-					assert.Equal(t, testProcedure, procedure)
+				func(ctx context.Context, r *authz.Request) error {
+					assert.Equal(t, testProcedure, r.Spec.Procedure)
+					assert.IsType(t, &emptypb.Empty{}, r.Message)
 					return tt.authzError
 				},
 			)
 
-			interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
+			interceptor, err := authz.NewInterceptor(
+				enforcer,
+				authz.WithIdentityFunc(identityOf(tt.identity)),
+			)
 			require.NoError(t, err)
 
-			mux := http.NewServeMux()
-			mux.Handle(testProcedure, connect.NewUnaryHandler(
-				testProcedure,
-				func(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
-					return connect.NewResponse(&emptypb.Empty{}), nil
-				},
-				connect.WithInterceptors(interceptor),
-			))
-
-			srv := startHTTPServer(t, mux)
+			srv := startUnaryServer(t, interceptor)
 
 			client := connect.NewClient[emptypb.Empty, emptypb.Empty](
 				srv.Client(),
@@ -110,13 +99,8 @@ func TestInterceptorStreamingHandler(t *testing.T) {
 		{
 			name:       "permission_denied",
 			identity:   "john@example.com",
-			authzError: authz.Errorf("permission denied"),
+			authzError: authz.ErrorPermissionDenied("permission denied"),
 			wantCode:   connect.CodePermissionDenied,
-		},
-		{
-			name:     "no_identity",
-			identity: nil,
-			wantCode: connect.CodeUnauthenticated,
 		},
 	}
 
@@ -124,18 +108,24 @@ func TestInterceptorStreamingHandler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			getIdentity := func(ctx context.Context) any {
-				return tt.identity
-			}
-
 			enforcer := authz.EnforcerFunc(
-				func(ctx context.Context, identity any, procedure string) error {
-					assert.Equal(t, testProcedure, procedure)
+				func(ctx context.Context, r *authz.Request) error {
+					assert.Equal(t, testProcedure, r.Spec.Procedure)
+					assert.Nil(t, r.Message, "streams authorise before any message")
+					assert.NotEmpty(t, r.Peer.Addr, "stream requests carry the peer")
+					assert.NotEmpty(
+						t,
+						r.Header.Get("Content-Type"),
+						"stream requests carry headers",
+					)
 					return tt.authzError
 				},
 			)
 
-			interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
+			interceptor, err := authz.NewInterceptor(
+				enforcer,
+				authz.WithIdentityFunc(identityOf(tt.identity)),
+			)
 			require.NoError(t, err)
 
 			mux := http.NewServeMux()
@@ -181,35 +171,27 @@ func TestInterceptorStreamingHandler(t *testing.T) {
 	}
 }
 
-func TestInterceptorStreamingClient(t *testing.T) {
+// Guards the v0.4.0 bug: the interceptor attached to a connect CLIENT denied
+// the client's own outbound calls.
+func TestInterceptorClientSidePassthrough(t *testing.T) {
 	t.Parallel()
 
-	// WrapStreamingClient should be a passthrough for server-side authorization
-	getIdentity := func(ctx context.Context) any {
-		return "jane@example.com"
-	}
-
 	var calledAuthz atomic.Bool
-	enforcer := authz.EnforcerFunc(func(ctx context.Context, identity any, procedure string) error {
+	enforcer := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
 		calledAuthz.Store(true)
-		return nil
+		return authz.ErrorPermissionDenied("must never run on clients")
 	})
 
-	interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
+	interceptor, err := authz.NewInterceptor(enforcer, authz.WithIdentityFunc(identityOf(nil)))
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()
-	mux.Handle(testProcedure, connect.NewBidiStreamHandler(
+	mux.Handle(testProcedure, connect.NewUnaryHandler(
 		testProcedure,
-		func(ctx context.Context, stream *connect.BidiStream[emptypb.Empty, emptypb.Empty]) error {
-			_, err := stream.Receive()
-			if err != nil {
-				return err
-			}
-			return stream.Send(&emptypb.Empty{})
+		func(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
+			return connect.NewResponse(&emptypb.Empty{}), nil
 		},
 	))
-
 	srv := startHTTPServer(t, mux)
 
 	client := connect.NewClient[emptypb.Empty, emptypb.Empty](
@@ -217,39 +199,142 @@ func TestInterceptorStreamingClient(t *testing.T) {
 		srv.URL+testProcedure,
 		connect.WithInterceptors(interceptor),
 	)
-
-	stream := client.CallBidiStream(context.Background())
-	t.Cleanup(func() {
-		assert.NoError(t, stream.CloseRequest())
-	})
-	t.Cleanup(func() {
-		assert.NoError(t, stream.CloseResponse())
-	})
-
-	err = stream.Send(&emptypb.Empty{})
+	_, err = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
 	require.NoError(t, err)
-
-	_, receiveErr := stream.Receive()
-	require.NoError(t, receiveErr)
-
-	// WrapStreamingClient is passthrough, so authz should not be called
-	assert.False(t, calledAuthz.Load(), "authz should not be called for client-side streaming")
+	assert.False(t, calledAuthz.Load(), "authz must not run on client interceptor chains")
 }
 
-func TestNewInterceptorNilArgs(t *testing.T) {
+func TestNewInterceptorValidation(t *testing.T) {
 	t.Parallel()
 
-	enforcer := authz.EnforcerFunc(func(ctx context.Context, identity any, procedure string) error {
+	_, err := authz.NewInterceptor(nil, authz.WithIdentityFunc(identityOf("user")))
+	require.ErrorIs(t, err, authz.ErrNilEnforcer)
+
+	_, err = authz.NewInterceptor(authz.EnforcerFunc(allowAll))
+	require.NoError(t, err) // an identity source is optional
+}
+
+func TestAnonymousReachesEnforcer(t *testing.T) {
+	t.Parallel()
+
+	var sawNilIdentity atomic.Bool
+	enforcer := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
+		if r.Identity == nil {
+			sawNilIdentity.Store(true)
+		}
 		return nil
 	})
-	getIdentity := func(ctx context.Context) any { return "user" }
 
-	_, err := authz.NewInterceptor(nil, enforcer)
-	require.ErrorIs(t, err, authz.ErrNilIdentityFunc)
-
-	_, err = authz.NewInterceptor(getIdentity, nil)
-	require.ErrorIs(t, err, authz.ErrNilEnforcer)
+	interceptor, err := authz.NewInterceptor(enforcer, authz.WithIdentityFunc(identityOf(nil)))
+	require.NoError(t, err)
+	srv := startUnaryServer(t, interceptor)
+	client := connect.NewClient[emptypb.Empty, emptypb.Empty](srv.Client(), srv.URL+testProcedure)
+	_, err = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
+	require.NoError(t, err)
+	assert.True(t, sawNilIdentity.Load(), "the enforcer decides anonymous requests")
 }
+
+func TestPanicRecovery(t *testing.T) {
+	t.Parallel()
+
+	var got authz.Decision
+	enforcer := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
+		panic("boom")
+	})
+	interceptor, err := authz.NewInterceptor(enforcer,
+		authz.WithIdentityFunc(identityOf("user")),
+		authz.WithDecisionHandler(func(ctx context.Context, d authz.Decision) { got = d }),
+	)
+	require.NoError(t, err)
+
+	srv := startUnaryServer(t, interceptor)
+	client := connect.NewClient[emptypb.Empty, emptypb.Empty](srv.Client(), srv.URL+testProcedure)
+
+	_, err = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.NotContains(t, err.Error(), "boom", "panic detail must not reach the wire")
+	require.Error(t, got.Error)
+	assert.Contains(t, got.Error.Error(), "boom")
+	assert.False(t, got.Allowed)
+}
+
+func TestErrorSanitization(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		enforceErr  error
+		wantCode    connect.Code
+		wantMessage string // checked as a substring of the wire error
+		leakedText  string // checked to be absent from the wire error
+	}{
+		{
+			name:        "uncoded_error_sanitized",
+			enforceErr:  errors.New("secret-internal-detail"),
+			wantCode:    connect.CodePermissionDenied,
+			wantMessage: "permission denied",
+			leakedText:  "secret-internal-detail",
+		},
+		{
+			name: "coded_error_passes_through",
+			enforceErr: connect.NewError(
+				connect.CodeUnavailable,
+				errors.New("policy backend down"),
+			),
+			wantCode:    connect.CodeUnavailable,
+			wantMessage: "policy backend down",
+		},
+		{
+			name: "wrapped_coded_error_passes_through",
+			enforceErr: &wrapError{
+				msg:   "outer",
+				inner: authz.ErrorUnauthenticated("token expired"),
+			},
+			wantCode:    connect.CodeUnauthenticated,
+			wantMessage: "token expired",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got authz.Decision
+			enforcer := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
+				return tt.enforceErr
+			})
+			interceptor, err := authz.NewInterceptor(enforcer,
+				authz.WithIdentityFunc(identityOf("user")),
+				authz.WithDecisionHandler(func(ctx context.Context, d authz.Decision) { got = d }),
+			)
+			require.NoError(t, err)
+
+			srv := startUnaryServer(t, interceptor)
+			client := connect.NewClient[emptypb.Empty, emptypb.Empty](
+				srv.Client(),
+				srv.URL+testProcedure,
+			)
+
+			_, err = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
+			require.Error(t, err)
+			assert.Equal(t, tt.wantCode, connect.CodeOf(err))
+			assert.Contains(t, err.Error(), tt.wantMessage)
+			if tt.leakedText != "" {
+				assert.NotContains(t, err.Error(), tt.leakedText)
+			}
+			assert.Equal(t, tt.enforceErr, got.Error, "Decision carries the original error")
+		})
+	}
+}
+
+type wrapError struct {
+	msg   string
+	inner error
+}
+
+func (e *wrapError) Error() string { return e.msg + ": " + e.inner.Error() }
+func (e *wrapError) Unwrap() error { return e.inner }
 
 func TestDecisionHandler(t *testing.T) {
 	t.Parallel()
@@ -269,12 +354,13 @@ func TestDecisionHandler(t *testing.T) {
 		{
 			name:       "denied",
 			identity:   "john@example.com",
-			authzError: authz.Errorf("denied"),
+			authzError: authz.ErrorPermissionDenied("denied"),
 		},
 		{
-			name:      "unauthenticated",
-			identity:  nil,
-			wantNilID: true,
+			name:        "anonymous",
+			identity:    nil,
+			wantAllowed: true,
+			wantNilID:   true,
 		},
 	}
 
@@ -283,109 +369,49 @@ func TestDecisionHandler(t *testing.T) {
 			t.Parallel()
 
 			var got authz.Decision
-			handler := func(ctx context.Context, d authz.Decision) {
-				got = d
-			}
+			enforcer := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
+				return tt.authzError
+			})
 
-			getIdentity := func(ctx context.Context) any { return tt.identity }
-			enforcer := authz.EnforcerFunc(
-				func(ctx context.Context, identity any, procedure string) error {
-					return tt.authzError
-				},
-			)
-
-			interceptor, err := authz.NewInterceptor(
-				getIdentity,
-				enforcer,
-				authz.WithDecisionHandler(handler),
+			interceptor, err := authz.NewInterceptor(enforcer,
+				authz.WithIdentityFunc(identityOf(tt.identity)),
+				authz.WithDecisionHandler(func(ctx context.Context, d authz.Decision) { got = d }),
 			)
 			require.NoError(t, err)
 
-			mux := http.NewServeMux()
-			mux.Handle(testProcedure, connect.NewUnaryHandler(
-				testProcedure,
-				func(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
-					return connect.NewResponse(&emptypb.Empty{}), nil
-				},
-				connect.WithInterceptors(interceptor),
-			))
-
-			srv := startHTTPServer(t, mux)
+			srv := startUnaryServer(t, interceptor)
 			client := connect.NewClient[emptypb.Empty, emptypb.Empty](
 				srv.Client(),
 				srv.URL+testProcedure,
 			)
 			_, _ = client.CallUnary(context.Background(), connect.NewRequest(&emptypb.Empty{}))
 
-			assert.Equal(t, testProcedure, got.Procedure)
+			require.NotNil(t, got.Request, "decision carries the request it was made on")
+			assert.Equal(t, testProcedure, got.Request.Spec.Procedure)
+			assert.IsType(t, &emptypb.Empty{}, got.Request.Message)
 			assert.Equal(t, tt.wantAllowed, got.Allowed)
+			assert.Equal(t, tt.wantAllowed, got.Error == nil, "Allowed mirrors Error")
+			assert.Positive(t, got.Duration)
 			if tt.wantNilID {
-				assert.Nil(t, got.Identity)
+				assert.Nil(t, got.Request.Identity)
 			} else {
-				assert.Equal(t, tt.identity, got.Identity)
-			}
-			if tt.wantAllowed {
-				assert.NoError(t, got.Error)
-			} else {
-				assert.Error(t, got.Error)
+				assert.Equal(t, tt.identity, got.Request.Identity)
 			}
 		})
 	}
 }
 
-func TestInferProcedure(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		url       string
-		wantProc  string
-		wantValid bool
-	}{
-		{
-			name:      "valid procedure",
-			url:       "https://api.example.com/greet.v1.GreetService/Greet",
-			wantProc:  "/greet.v1.GreetService/Greet",
-			wantValid: true,
+func startUnaryServer(tb testing.TB, interceptor *authz.Interceptor) *httptest.Server {
+	tb.Helper()
+	mux := http.NewServeMux()
+	mux.Handle(testProcedure, connect.NewUnaryHandler(
+		testProcedure,
+		func(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
+			return connect.NewResponse(&emptypb.Empty{}), nil
 		},
-		{
-			name:      "valid with query params",
-			url:       "https://api.example.com/greet.v1.GreetService/Greet?foo=bar",
-			wantProc:  "/greet.v1.GreetService/Greet",
-			wantValid: true,
-		},
-		{
-			name:      "invalid - no method",
-			url:       "https://api.example.com/greet.v1.GreetService/",
-			wantProc:  "/greet.v1.GreetService/",
-			wantValid: false,
-		},
-		{
-			name:      "invalid - no service",
-			url:       "https://api.example.com/Greet",
-			wantProc:  "/Greet",
-			wantValid: false,
-		},
-		{
-			name:      "invalid - root path",
-			url:       "https://api.example.com/",
-			wantProc:  "/",
-			wantValid: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			u, err := url.Parse(tt.url)
-			require.NoError(t, err)
-
-			proc, valid := authz.InferProcedure(u)
-			assert.Equal(t, tt.wantProc, proc)
-			assert.Equal(t, tt.wantValid, valid)
-		})
-	}
+		connect.WithInterceptors(interceptor),
+	))
+	return startHTTPServer(tb, mux)
 }
 
 func startHTTPServer(tb testing.TB, h http.Handler) *httptest.Server {
