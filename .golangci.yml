@@ -2,7 +2,7 @@ version: "2"
 
 run:
   concurrency: 1
-  go: "1.25"
+  go: "1.27"
   relative-path-mode: cfg
   build-tags:
     - codeanalysis
