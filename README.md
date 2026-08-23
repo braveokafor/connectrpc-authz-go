@@ -1,12 +1,14 @@
 authz
 =====
 [![Build](https://github.com/braveokafor/connectrpc-authz-go/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/braveokafor/connectrpc-authz-go/actions/workflows/ci.yaml)
-[![Report Card](https://goreportcard.com/badge/github.com/braveokafor/connectrpc-authz-go)](https://goreportcard.com/report/github.com/braveokafor/connectrpc-authz-go)
 [![GoDoc](https://pkg.go.dev/badge/github.com/braveokafor/connectrpc-authz-go.svg)](https://pkg.go.dev/github.com/braveokafor/connectrpc-authz-go)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/braveokafor/connectrpc-authz-go/blob/main/LICENSE)
 
-`github.com/braveokafor/connectrpc-authz-go` provides authorization interceptors for [Connect](https://connectrpc.com/). It works with any authentication system (including [connectrpc.com/authn](https://connectrpc.com/authn), custom context-based auth, or external providers), and supports both custom authorization logic and policy-based authorization with [Casbin](https://casbin.org/).
+`github.com/braveokafor/connectrpc-authz-go` provides authorisation interceptors for [Connect](https://connectrpc.com/). The identity comes from any authentication layer, for example [connectrpc.com/authn](https://github.com/connectrpc/authn-go).
 
-Interceptors built with `authz` cover both unary and streaming RPCs made with the Connect, gRPC, and gRPC-Web protocols.
+The core package defines `Request`, `Enforcer`, and the interceptor, and depends only on `connectrpc.com/connect`. The [`casbin`](casbin/) subpackage implements `Enforcer` with [Casbin](https://casbin.org/).
+
+The interceptor supports unary and streaming RPCs on the Connect, gRPC, and gRPC-Web protocols.
 
 ## Installation
 
@@ -14,9 +16,7 @@ Interceptors built with `authz` cover both unary and streaming RPCs made with th
 go get github.com/braveokafor/connectrpc-authz-go
 ```
 
-## A small example
-
-Curious what all this looks like in practice? Here's a simple role-based authorization check:
+## Example
 
 ```go
 package main
@@ -27,177 +27,158 @@ import (
 	"net/http"
 	"slices"
 
+	"connectrpc.com/authn"
 	"connectrpc.com/connect"
 	authz "github.com/braveokafor/connectrpc-authz-go"
-	"example.com/gen/greet/v1/greetv1connect"
+	"github.com/braveokafor/connectrpc-authz-go/examples/bookstore/gen/bookstore/v1/bookstorev1connect"
 )
 
-type User struct {
-	Email string
-	Roles []string
+type Identity struct {
+	Subject string
+	Roles   []string
 }
 
 func main() {
-	// Custom authorization logic as an EnforcerFunc
-	checkAuth := authz.EnforcerFunc(func(ctx context.Context, identity any, procedure string) error {
-		user, ok := identity.(*User)
+	// Deny by default. Allow what you recognise.
+	checkAuth := authz.EnforcerFunc(func(ctx context.Context, r *authz.Request) error {
+		id, ok := r.Identity.(*Identity)
 		if !ok {
-			return authz.Errorf("invalid identity type")
+			return authz.ErrorUnauthenticated("authentication required")
 		}
-
-		// Require admin role for admin procedures
-		if procedure == "/admin.v1.AdminService/DeleteUser" {
-			if !slices.Contains(user.Roles, "admin") {
-				return authz.Errorf("requires admin role")
+		switch r.Spec.Procedure {
+		case "/bookstore.v1.BookstoreService/DeleteBook":
+			if !slices.Contains(id.Roles, "admin") {
+				return authz.ErrorPermissionDenied("requires admin role")
 			}
+			return nil
+		case "/bookstore.v1.BookstoreService/GetBook":
+			return nil
 		}
-		return nil
+		return authz.ErrorPermissionDenied("permission denied")
 	})
 
-	getIdentity := func(ctx context.Context) any {
-		// Extract identity from context (set by your authentication middleware)
-		user, _ := ctx.Value("user").(*User)
-		return user
-	}
-
-
-	// Create authorization interceptor
-	interceptor, err := authz.NewInterceptor(getIdentity, checkAuth)
+	interceptor, err := authz.NewInterceptor(checkAuth,
+		authz.WithIdentityFunc(authn.GetInfo), // bridge from authn middleware
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	mux := http.NewServeMux()
-	// Register service with interceptor
-	mux.Handle(greetv1connect.NewGreetServiceHandler(
-		&GreetService{},
+	mux.Handle(bookstorev1connect.NewBookstoreServiceHandler(
+		NewBookstoreServer(),
 		connect.WithInterceptors(interceptor),
 	))
 
 	log.Println("Server starting on :8080")
-	http.ListenAndServe("localhost:8080", mux)
+	http.ListenAndServe("localhost:8080", authn.NewMiddleware(authenticate).Wrap(mux))
 }
 ```
 
-The interceptor extracts the identity using `getIdentity`, then calls your `Enforcer` to check permissions. If authorization fails, the RPC returns `CodePermissionDenied`. If no identity is found, it returns `CodeUnauthenticated`.
+## The Request
 
-## Features
+```go
+type Request struct {
+	Identity any          // authenticated identity, or nil for an unauthenticated caller
+	Spec     connect.Spec // procedure, schema, stream type
+	Peer     connect.Peer
+	Header   http.Header
+	Message  any          // request message, or nil for streaming RPCs
+}
+```
 
-- **Decoupled Design**: Works with any authentication system - no dependencies on [authn-go](https://github.com/connectrpc/authn-go) or specific auth libraries
-- **Flexible Authorization**: Bring your own authz logic via `EnforcerFunc`, or use built-in Casbin integration
-- **Casbin Support**: Optional Casbin adapter with file-based, adapter-based, and programmatic configuration
-- **Decision Hooks**: Optional `DecisionFunc` callback for logging, metrics, audit trails, and webhooks
-- **Unary and Streaming**: Supports both unary and streaming RPCs
-- **ConnectRPC Native**: Implements `connect.Interceptor` interface following production patterns
+## The casbin implementation
 
-## Decision Handler
+```go
+import (
+	_ "embed"
 
-React to authorization outcomes - logging, metrics, audit trails, Slack webhooks, Kafka events:
+	authzcasbin "github.com/braveokafor/connectrpc-authz-go/casbin"
+)
+
+//go:embed policies/model.conf
+var model string
+
+//go:embed policies/policy.csv
+var policy string
+
+enforcer, err := authzcasbin.NewFromString(model, policy,
+	func(r *authz.Request) []string {
+		id, ok := r.Identity.(*Identity)
+		if !ok {
+			return nil
+		}
+		return []string{id.Subject}
+	})
+
+interceptor, err := authz.NewInterceptor(enforcer, authz.WithIdentityFunc(authn.GetInfo))
+```
+
+Constructors:
+
+- `New(engine, subjects, opts...)` wraps an existing `casbin.IEnforcer`.
+- `NewFromString(modelText, policyText, subjects, opts...)` builds a `SyncedEnforcer` from model and policy text.
+
+The library maps the request to Casbin as `(subject, object, action)`:
+
+- `SubjectsFunc` derives the subjects. Keep a role lookup that needs I/O in the authentication layer.
+- Objects default to `{r.Spec.Procedure}`. `WithObjects` builds other objects, and can use the message.
+- The action defaults to `"execute"`. `WithAction` changes it.
+
+Semantics:
+
+- The enforcer allows a request when, for every object, at least one subject has access.
+- An allow from one subject overrides a deny row that names another. Give an absolute deny rule the subject `*`.
+- The enforcer denies an identified caller that has no subjects. It returns `CodeUnauthenticated` for a nil identity with no subjects. It denies a request that has no objects. It denies a request when the engine returns an error.
+
+## Write your own Enforcer
+
+For a policy outside `(subject, object, action)`, implement the one method, for example multi-tenancy with Casbin RBAC and domains:
+
+```go
+type tenantEnforcer struct{ e *casbin.SyncedEnforcer }
+
+func (t *tenantEnforcer) Enforce(ctx context.Context, r *authz.Request) error {
+	id, ok := r.Identity.(*Identity)
+	if !ok {
+		return authz.ErrorUnauthenticated("authentication required")
+	}
+	tenant := r.Header.Get("Tenant-Id")
+	if m, ok := r.Message.(interface{ GetTenantId() string }); ok && m.GetTenantId() != "" {
+		tenant = m.GetTenantId()
+	}
+	if tenant == "" {
+		return authz.ErrorPermissionDenied("missing tenant")
+	}
+	ok, err := t.e.Enforce(id.Subject, tenant, r.Spec.Procedure, "execute")
+	if err != nil {
+		return err // uncoded, so the wire gets a generic denial and the log gets the detail
+	}
+	if !ok {
+		return authz.ErrorPermissionDenied("permission denied")
+	}
+	return nil
+}
+```
+
+## The decision handler
+
+Use the decision handler for logging, metrics, and audit trails:
 
 ```go
 onDecision := func(ctx context.Context, d authz.Decision) {
-	if d.Allowed {
-		log.Printf("ALLOW subject=%v procedure=%s", d.Identity, d.Procedure)
-	} else {
-		log.Printf("DENY  subject=%v procedure=%s err=%v", d.Identity, d.Procedure, d.Error)
-	}
+	log.Printf("authz procedure=%s allowed=%t duration=%s err=%v",
+		d.Request.Spec.Procedure, d.Allowed, d.Duration, d.Error)
 }
 
-interceptor, err := authz.NewInterceptor(getIdentity, enforcer,
+interceptor, err := authz.NewInterceptor(enforcer,
+	authz.WithIdentityFunc(authn.GetInfo),
 	authz.WithDecisionHandler(onDecision),
 )
 ```
 
-## Casbin Integration
+`Duration` is the time in the `Enforcer`. `Error` is the original error before wire sanitisation. The handler runs one time for each decision, allow or deny. The call is synchronous. `Request.Identity` and `Request.Message` may contain personal data or secrets
 
-For policy-based authorization, use the built-in Casbin enforcer:
+## Full example
 
-```go
-// Extract subject from identity for Casbin
-extractSubject := func(identity any) []string {
-	user, ok := identity.(*User)
-	if !ok {
-		return nil
-	}
-	return []string{user.Email}
-}
-
-// Create Casbin enforcer from policy files
-enforcer, err := authz.NewCasbinEnforcerFromFiles(
-	"model.conf",
-	"policy.csv",
-	extractSubject,
-)
-if err != nil {
-	log.Fatal(err)
-}
-
-// Create interceptor - CasbinEnforcer implements Enforcer
-interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
-```
-
-Three constructors available:
-- `NewCasbinEnforcerFromFiles(modelPath, policyPath, subjectExtractor)` - Casbin file paths
-- `NewCasbinEnforcerFromAdapter(model, adapter, subjectExtractor)` - Database/Redis/custom adapters
-- `NewCasbinEnforcerFromString(modelText, policyText, subjectExtractor)` - Mostly for testing
-
-### Custom action resolver
-
-By default, the Casbin action is `"execute"`. Use `WithActionResolver` for fine-grained actions:
-
-```go
-enforcer, err := authz.NewCasbinEnforcerFromFiles(
-	"model.conf", "policy.csv", extractSubject,
-	authz.WithActionResolver(func(procedure string) string {
-		if strings.HasPrefix(procedure, "/read.") {
-			return "read"
-		}
-		return "write"
-	}),
-)
-```
-
-## Working with Authentication
-
-This library is designed to work with any authentication system. Common patterns:
-
-**With [connectrpc.com/authn](https://github.com/connectrpc/authn-go):**
-
-```go
-import "connectrpc.com/authn"
-
-getIdentity := func(ctx context.Context) any {
-	return authn.GetInfo(ctx) // Returns identity set by authn middleware
-}
-
-interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
-```
-
-**Custom authentication:**
-
-```go
-type contextKey struct{}
-
-getIdentity := func(ctx context.Context) any {
-	user, _ := ctx.Value(contextKey{}).(*User)
-	return user
-}
-
-interceptor, err := authz.NewInterceptor(getIdentity, enforcer)
-```
-
-## Full Example
-
-See [examples/fullstack](examples/fullstack) for a complete runnable service with:
-- JWT token issuance and validation
-- `connectrpc.com/authn` middleware
-- Casbin RBAC policies
-- Decision handler logging
-- gRPC reflection
-- curl and grpcurl usage examples
-
-## Status
-
-Requires Go 1.26+.
-
-This project follows semantic versioning.
+See [examples/bookstore](examples/bookstore) for a runnable Casbin example.

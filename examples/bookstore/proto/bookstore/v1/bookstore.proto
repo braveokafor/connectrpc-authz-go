@@ -1,0 +1,91 @@
+// Copyright 2016 Google Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+syntax = "proto3";
+
+package bookstore.v1;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/braveokafor/connectrpc-authz-go/examples/bookstore/gen/bookstore/v1;bookstorev1";
+
+// BookstoreService manages books on shelves and runs live auctions.
+service BookstoreService {
+  // GetBook returns one book by id.
+  rpc GetBook(GetBookRequest) returns (Book);
+  // ListBooks returns the books on a shelf.
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse);
+  // CreateBook adds a book to a shelf.
+  rpc CreateBook(CreateBookRequest) returns (Book);
+  // DeleteBook removes a book by id.
+  rpc DeleteBook(DeleteBookRequest) returns (google.protobuf.Empty);
+  // ImportBooks adds a stream of books in one call.
+  rpc ImportBooks(stream CreateBookRequest) returns (ImportSummary);
+  // WatchAuction streams bidding updates for a book until the client cancels.
+  rpc WatchAuction(WatchAuctionRequest) returns (stream AuctionUpdate);
+  // Bid places bids and streams back every update on the book's auction.
+  rpc Bid(stream BidRequest) returns (stream AuctionUpdate);
+}
+
+message Book {
+  int64 id = 1;
+  string title = 2;
+  string author = 3;
+  int64 shelf = 4;
+  // owner is the subject that created the book.
+  string owner = 5;
+}
+
+message GetBookRequest {
+  int64 id = 1;
+}
+
+message ListBooksRequest {
+  int64 shelf = 1;
+}
+
+message ListBooksResponse {
+  repeated Book books = 1;
+}
+
+message CreateBookRequest {
+  string title = 1;
+  string author = 2;
+  int64 shelf = 3;
+}
+
+message DeleteBookRequest {
+  int64 id = 1;
+}
+
+message ImportSummary {
+  int32 created = 1;
+}
+
+message WatchAuctionRequest {
+  int64 book = 1;
+}
+
+message BidRequest {
+  int64 book = 1;
+  double amount = 2;
+}
+
+message AuctionUpdate {
+  int64 book = 1;
+  double high_bid = 2;
+  string bidder = 3;
+}

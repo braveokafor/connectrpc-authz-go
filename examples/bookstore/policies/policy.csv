@@ -1,0 +1,16 @@
+p, viewer, /bookstore.v1.BookstoreService/GetBook, execute
+p, viewer, /bookstore.v1.BookstoreService/ListBooks, execute
+p, viewer, /bookstore.v1.BookstoreService/WatchAuction, execute
+p, clerk, /bookstore.v1.BookstoreService/CreateBook, execute
+p, clerk, /bookstore.v1.BookstoreService/ImportBooks, execute
+p, admin, /bookstore.v1.BookstoreService/*, execute
+p, bidder, /bookstore.v1.BookstoreService/WatchAuction, execute
+p, bidder, /bookstore.v1.BookstoreService/Bid, execute
+
+g, admin, clerk
+g, clerk, viewer
+
+g, alice, admin
+g, bob, clerk
+g, carol, viewer
+g, dave, bidder
