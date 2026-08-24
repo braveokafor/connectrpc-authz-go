@@ -53,34 +53,33 @@ func TestConstructorValidation(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestEnforceSemantics pins the binding's contracts. For every object some subject must allow. The deny code depends on whether the caller was identified. An empty derivation denies.
+// TestEnforceSemantics pins the binding's contracts.
 func TestEnforceSemantics(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	newEnforcer := func(t *testing.T, opts ...casbin.Option) *casbin.Enforcer {
-		t.Helper()
-		e, err := casbin.NewFromString(modelText, policyText, rolesOf, opts...)
-		require.NoError(t, err)
-		return e
-	}
+	e, err := casbin.NewFromString(modelText, policyText, rolesOf)
+	require.NoError(t, err)
 
 	isConnectErr := func(err error) bool {
 		var cerr *connect.Error
 		return errors.As(err, &cerr)
 	}
 
-	t.Run("forall_objects_exists_subject", func(t *testing.T) {
+	t.Run("exists_subject_allowing_procedure", func(t *testing.T) {
 		t.Parallel()
-		e := newEnforcer(t, casbin.WithObjects(func(*authz.Request) []string {
-			return []string{"obj1", "obj2"}
+		require.NoError(t, e.Enforce(ctx, &authz.Request{
+			Identity: []string{"roleB", "roleA"},
+			Spec:     connect.Spec{Procedure: "obj1"},
 		}))
+	})
 
-		// roleA covers obj1, roleB covers obj2: per-object OR over subjects allows.
-		require.NoError(t, e.Enforce(ctx, &authz.Request{Identity: []string{"roleA", "roleB"}}))
-
-		// roleA alone leaves obj2 uncovered: AND over objects denies, uncoded.
-		err := e.Enforce(ctx, &authz.Request{Identity: []string{"roleA"}})
+	t.Run("no_subject_allows_procedure", func(t *testing.T) {
+		t.Parallel()
+		err := e.Enforce(ctx, &authz.Request{
+			Identity: []string{"roleA"},
+			Spec:     connect.Spec{Procedure: "obj2"},
+		})
 		require.Error(t, err)
 		assert.False(
 			t,
@@ -92,23 +91,15 @@ func TestEnforceSemantics(t *testing.T) {
 
 	t.Run("anonymous_without_subjects", func(t *testing.T) {
 		t.Parallel()
-		err := newEnforcer(t).Enforce(ctx, &authz.Request{Identity: nil})
+		err := e.Enforce(ctx, &authz.Request{Identity: nil})
 		require.Error(t, err)
 		assert.Equal(t, connect.CodeUnauthenticated, connect.CodeOf(err))
 	})
 
 	t.Run("identified_without_subjects", func(t *testing.T) {
 		t.Parallel()
-		err := newEnforcer(t).Enforce(ctx, &authz.Request{Identity: []string{}})
+		err := e.Enforce(ctx, &authz.Request{Identity: []string{}})
 		require.Error(t, err)
 		assert.False(t, isConnectErr(err), "an identified caller must not get Unauthenticated")
-	})
-
-	t.Run("empty_objects", func(t *testing.T) {
-		t.Parallel()
-		e := newEnforcer(t, casbin.WithObjects(func(*authz.Request) []string { return nil }))
-		err := e.Enforce(ctx, &authz.Request{Identity: []string{"roleA"}})
-		require.Error(t, err)
-		assert.False(t, isConnectErr(err))
 	})
 }

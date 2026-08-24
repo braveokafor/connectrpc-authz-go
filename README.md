@@ -116,20 +116,18 @@ interceptor, err := authz.NewInterceptor(enforcer, authz.WithIdentityFunc(authn.
 
 Constructors:
 
-- `New(engine, subjects, opts...)` wraps an existing `casbin.IEnforcer`.
-- `NewFromString(modelText, policyText, subjects, opts...)` builds a `SyncedEnforcer` from model and policy text.
+- `New(engine, subjects)` wraps an existing `casbin.IEnforcer`.
+- `NewFromString(modelText, policyText, subjects)` builds a `SyncedEnforcer` from model and policy text.
 
-The library maps the request to Casbin as `(subject, object, action)`:
-
-- `SubjectsFunc` derives the subjects. Keep a role lookup that needs I/O in the authentication layer.
-- Objects default to `{r.Spec.Procedure}`. `WithObjects` builds other objects, and can use the message.
-- The action defaults to `"execute"`. `WithAction` changes it.
+The library maps the request to Casbin as `(subject, r.Spec.Procedure, "execute")`. `SubjectsFunc` derives the subjects. Keep a role lookup that needs I/O in the authentication layer.
 
 Semantics:
 
-- The enforcer allows a request when, for every object, at least one subject has access.
+- The enforcer allows a request when at least one subject has access to the procedure.
 - An allow from one subject overrides a deny row that names another. Give an absolute deny rule the subject `*`.
-- The enforcer denies an identified caller that has no subjects. It returns `CodeUnauthenticated` for a nil identity with no subjects. It denies a request that has no objects. It denies a request when the engine returns an error.
+- The enforcer denies an identified caller that has no subjects. It returns `CodeUnauthenticated` for a nil identity with no subjects. It denies a request when the engine returns an error.
+
+To authorise something other than the procedure, such as a name carried in the request message, implement `authz.Enforcer`.
 
 ## Write your own Enforcer
 
